@@ -43,6 +43,8 @@ pub mod solar;
 pub mod spk;
 pub mod transform;
 
+pub(crate) mod cache;
+
 #[cfg(feature = "metaload")]
 pub mod metaload;
 
@@ -78,6 +80,11 @@ pub struct Almanac {
     pub location_data: IndexMap<String, LocationDataSet>,
     /// Dataset of instruments
     pub instrument_data: IndexMap<String, InstrumentDataSet>,
+    /// Internal ephemeris query cache. Invalidated whenever an SPK is loaded, unloaded,
+    /// or swapped through the supported methods; mutating `spk_data` directly bypasses
+    /// invalidation and is unsupported — cached entries may then point at stale or
+    /// replaced kernel data.
+    pub(crate) cache: cache::EphemerisCache,
 }
 
 impl fmt::Display for Almanac {
@@ -497,6 +504,10 @@ impl Almanac {
 
         let buffer = &mut entry.bytes;
 
+        // Invalidate before mutating: if the copy below fails midway, the kernel bytes
+        // are already cleared and no memo may point into them. The slot order may also
+        // change on rename, staling memoized spk_no values.
+        self.cache.invalidate();
         buffer.clear(); // Sets len to 0, keeps capacity
         buffer.reserve(file_len as usize); // Ensure we have enough space to avoid re-allocs
 

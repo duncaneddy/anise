@@ -11,7 +11,9 @@
 use snafu::ResultExt;
 
 use super::{EphemerisError, SPKSnafu};
+use crate::DBL_SIZE;
 use crate::almanac::Almanac;
+use crate::almanac::cache::DecodedSplineHeader;
 use crate::ephemerides::EphemInterpolationSnafu;
 use crate::hifitime::Epoch;
 use crate::math::Vector3;
@@ -53,6 +55,16 @@ impl Almanac {
             .get_index(spk_no)
             .ok_or(EphemerisError::Unreachable)?;
 
+        // Fetch the header memoized by a previous query, only if it was decoded from
+        // this exact segment (the memo records which segment it came from).
+        let decoded_memo = self
+            .cache
+            .spk_segment(source.ephemeris_id)
+            .filter(|memo| {
+                memo.spk_no == spk_no && memo.daf_idx == daf_idx && memo.idx_in_spk == idx_in_spk
+            })
+            .and_then(|memo| memo.decoded);
+
         // Now let's simply evaluate the data
 
         let (pos_km, vel_km_s) = match summary.data_type()? {
@@ -66,20 +78,108 @@ impl Almanac {
                     .context(EphemInterpolationSnafu)?
             }
             DafDataType::Type2ChebyshevTriplet => {
-                let data = spk_data
-                    .nth_data::<Type2ChebyshevSet>(daf_idx, idx_in_spk)
-                    .context(SPKSnafu {
-                        action: "fetching data for interpolation",
-                    })?;
+                let dtype = DafDataType::Type2ChebyshevTriplet;
+                let cached = match decoded_memo {
+                    Some(header) if header.dtype == dtype => {
+                        // Defensive guard: a validated segment always holds its four trailing
+                        // metadata doubles plus at least one coefficient; fall back to the
+                        // full decode otherwise.
+                        spk_data
+                            .f64_data_in_range(header.dbl_byte_range)
+                            .filter(|slice| slice.len() >= 5)
+                            .map(|slice| Type2ChebyshevSet {
+                                init_epoch: header.init_epoch,
+                                interval_length: header.interval_length,
+                                rsize: header.rsize,
+                                num_records: header.num_records,
+                                record_data: &slice[..slice.len() - 4],
+                            })
+                    }
+                    _ => None,
+                };
+                let data = match cached {
+                    Some(data) => data,
+                    None => {
+                        let data = spk_data
+                            .nth_data::<Type2ChebyshevSet>(daf_idx, idx_in_spk)
+                            .context(SPKSnafu {
+                                action: "fetching data for interpolation",
+                            })?;
+                        // Same range as `data_slice` resolves for this summary.
+                        let dbl_byte_range = (
+                            (summary.start_index() - 1) * DBL_SIZE,
+                            summary.end_index() * DBL_SIZE,
+                        );
+                        self.cache.store_decoded(
+                            source.ephemeris_id,
+                            spk_no,
+                            daf_idx,
+                            idx_in_spk,
+                            DecodedSplineHeader {
+                                dtype,
+                                init_epoch: data.init_epoch,
+                                interval_length: data.interval_length,
+                                rsize: data.rsize,
+                                num_records: data.num_records,
+                                dbl_byte_range,
+                            },
+                        );
+                        data
+                    }
+                };
                 data.evaluate(epoch, summary)
                     .context(EphemInterpolationSnafu)?
             }
             DafDataType::Type3ChebyshevSextuplet => {
-                let data = spk_data
-                    .nth_data::<Type3ChebyshevSet>(daf_idx, idx_in_spk)
-                    .context(SPKSnafu {
-                        action: "fetching data for interpolation",
-                    })?;
+                let dtype = DafDataType::Type3ChebyshevSextuplet;
+                let cached = match decoded_memo {
+                    Some(header) if header.dtype == dtype => {
+                        // Defensive guard: a validated segment always holds its four trailing
+                        // metadata doubles plus at least one coefficient; fall back to the
+                        // full decode otherwise.
+                        spk_data
+                            .f64_data_in_range(header.dbl_byte_range)
+                            .filter(|slice| slice.len() >= 5)
+                            .map(|slice| Type3ChebyshevSet {
+                                init_epoch: header.init_epoch,
+                                interval_length: header.interval_length,
+                                rsize: header.rsize,
+                                num_records: header.num_records,
+                                record_data: &slice[..slice.len() - 4],
+                            })
+                    }
+                    _ => None,
+                };
+                let data = match cached {
+                    Some(data) => data,
+                    None => {
+                        let data = spk_data
+                            .nth_data::<Type3ChebyshevSet>(daf_idx, idx_in_spk)
+                            .context(SPKSnafu {
+                                action: "fetching data for interpolation",
+                            })?;
+                        // Same range as `data_slice` resolves for this summary.
+                        let dbl_byte_range = (
+                            (summary.start_index() - 1) * DBL_SIZE,
+                            summary.end_index() * DBL_SIZE,
+                        );
+                        self.cache.store_decoded(
+                            source.ephemeris_id,
+                            spk_no,
+                            daf_idx,
+                            idx_in_spk,
+                            DecodedSplineHeader {
+                                dtype,
+                                init_epoch: data.init_epoch,
+                                interval_length: data.interval_length,
+                                rsize: data.rsize,
+                                num_records: data.num_records,
+                                dbl_byte_range,
+                            },
+                        );
+                        data
+                    }
+                };
                 data.evaluate(epoch, summary)
                     .context(EphemInterpolationSnafu)?
             }

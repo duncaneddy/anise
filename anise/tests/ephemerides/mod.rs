@@ -8,6 +8,7 @@
  * Documentation: https://nyxspace.com/
  */
 
+mod cache;
 mod parent_translation_verif;
 mod paths;
 mod transform;

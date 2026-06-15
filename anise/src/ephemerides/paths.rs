@@ -32,10 +32,14 @@ impl Almanac {
     pub fn try_find_ephemeris_root(&self) -> Result<NaifId, EphemerisError> {
         ensure!(self.num_loaded_spk() > 0, NoEphemerisLoadedSnafu);
 
+        if let Some(root) = self.cache.root() {
+            return Ok(root);
+        }
+
         // The common center is the absolute minimum of all centers due to the NAIF numbering.
         let mut common_center = i32::MAX;
 
-        for spk in self.spk_data.values().rev() {
+        'outer: for spk in self.spk_data.values().rev() {
             for block_result in spk.iter_summary_blocks() {
                 let these_summaries = match block_result {
                     Ok(s) => s,
@@ -50,12 +54,14 @@ impl Almanac {
                         common_center = summary.center_id;
                         if common_center == SOLAR_SYSTEM_BARYCENTER {
                             // We're at the SSB, there is nothing higher up
-                            return Ok(common_center);
+                            break 'outer;
                         }
                     }
                 }
             }
         }
+
+        self.cache.store_root(common_center);
         Ok(common_center)
     }
 

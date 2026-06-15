@@ -25,6 +25,7 @@ use crate::{NaifId, ephemerides::EphemerisError};
 use log::{error, warn};
 
 use super::Almanac;
+use super::cache::SpkSegmentMemo;
 
 impl Almanac {
     pub fn from_spk(spk: SPK) -> Self {
@@ -48,6 +49,7 @@ impl Almanac {
         if self.spk_data.insert(alias, spk).is_some() {
             warn!("{msg}");
         }
+        self.cache.invalidate();
         self
     }
 
@@ -60,6 +62,7 @@ impl Almanac {
                 action: "unload ephemeris",
             })
         } else {
+            self.cache.invalidate();
             Ok(())
         }
     }
@@ -101,21 +104,64 @@ impl Almanac {
         })
     }
 
-    /// Returns the summary given the name of the summary record if that summary has data defined at the requested epoch
+    /// Returns the summary given the ID of the summary record if that summary has data defined at the requested epoch
     pub fn spk_summary_at_epoch(
         &self,
         id: i32,
         epoch: Epoch,
     ) -> Result<(&SPKSummaryRecord, usize, Option<usize>, usize), EphemerisError> {
-        for (spk_no, spk) in self.spk_data.values().rev().enumerate() {
+        // Fast path: validate the memoized location from the previous query for this ID.
+        // The memo holds byte ranges and bounds resolved at store time, so a hit costs a
+        // map probe, one epoch conversion, f64 comparisons, and two bounds-checked casts —
+        // no file-record re-parse. The live summary is still re-read and must match the
+        // memoized identity and bounds; any mismatch falls back to the full search below.
+        if let Some(memo) = self.cache.spk_segment(id) {
+            let et_s = epoch.to_et_seconds();
+            // Tight f64 bounds: epochs at or beyond the segment edges generally miss the
+            // memo and resolve through the full search's exact ±100 ns padded semantics.
+            if et_s >= memo.start_et_s
+                && et_s <= memo.end_et_s
+                && let Some((_, spk)) = self.spk_data.get_index(memo.spk_no)
+                && let Some(summaries) = spk.data_summaries_in_range(memo.summaries_byte_range)
+                && let Some(summary) = summaries.get(memo.idx_in_spk)
+                && summary.id() == id
+                && summary.start_epoch_et_s() == memo.start_et_s
+                && summary.end_epoch_et_s() == memo.end_et_s
+            {
+                return Ok((summary, memo.spk_no, memo.daf_idx, memo.idx_in_spk));
+            }
+        }
+
+        for (rev_no, spk) in self.spk_data.values().rev().enumerate() {
             if let Ok((summary, daf_idx, idx_in_spk)) = spk.summary_from_id_at_epoch(id, epoch) {
                 // NOTE: We're iterating backward, so the correct SPK number is "total loaded" minus "current iteration".
-                return Ok((
-                    summary,
-                    self.num_loaded_spk() - spk_no - 1,
-                    daf_idx,
-                    idx_in_spk,
-                ));
+                let spk_no = self.num_loaded_spk() - rev_no - 1;
+                // Memoize only when no other kernel can shadow this ID: the match must come
+                // from the chronologically ordered index (unique segment per epoch within this
+                // file), and no higher-precedence SPK may contain this ID at any epoch.
+                // Ineligible IDs simply run the full search on every query.
+                let memo_safe = spk.index.contains_key(&id)
+                    && self
+                        .spk_data
+                        .values()
+                        .rev()
+                        .take(rev_no)
+                        .all(|higher| higher.summary_from_id(id).is_err());
+                if memo_safe && let Ok(range) = spk.summaries_byte_range(daf_idx) {
+                    self.cache.store_spk_segment(
+                        id,
+                        SpkSegmentMemo {
+                            spk_no,
+                            daf_idx,
+                            idx_in_spk,
+                            summaries_byte_range: range,
+                            start_et_s: summary.start_epoch_et_s(),
+                            end_et_s: summary.end_epoch_et_s(),
+                            decoded: None,
+                        },
+                    );
+                }
+                return Ok((summary, spk_no, daf_idx, idx_in_spk));
             }
         }
 
@@ -333,6 +379,42 @@ mod ut_almanac_spk {
                 .common_ephemeris_path(MOON_J2000, EARTH_J2000, e)
                 .is_err(),
             "empty Almanac should report an error"
+        );
+    }
+
+    #[test]
+    fn cache_root_memo_and_invalidation() {
+        let almanac = Almanac::new("../data/de440s.bsp").unwrap();
+        assert!(almanac.cache.root().is_none(), "cache must start cold");
+
+        let root = almanac.try_find_ephemeris_root().unwrap();
+        assert_eq!(
+            almanac.cache.root(),
+            Some(root),
+            "root must be memoized after the first call"
+        );
+        // Second call must return the memoized value.
+        assert_eq!(almanac.try_find_ephemeris_root().unwrap(), root);
+
+        // The segment memo must populate on a summary query and clear on invalidation.
+        let epoch = Epoch::from_gregorian_at_noon(2024, 1, 1, hifitime::TimeScale::ET);
+        almanac.spk_summary_at_epoch(301, epoch).unwrap();
+        assert!(
+            almanac.cache.spk_segment(301).is_some(),
+            "segment memo must be populated after a query"
+        );
+
+        // Loading another SPK must invalidate the memo.
+        let bytes = crate::file2heap!("../data/de440s.bsp").unwrap();
+        let spk = crate::naif::SPK::parse(bytes).unwrap();
+        let almanac = almanac.with_spk_as(spk, Some("copy".to_string()));
+        assert!(
+            almanac.cache.root().is_none(),
+            "with_spk_as must invalidate the cache"
+        );
+        assert!(
+            almanac.cache.spk_segment(301).is_none(),
+            "with_spk_as must clear segment memos too"
         );
     }
 }

@@ -291,6 +291,35 @@ impl<R: NAIFSummaryRecord> DAF<R> {
         Ok(summaries)
     }
 
+    /// Returns the byte range of the data summaries within the record at `daf_idx`
+    /// (or the file record's forward index). Parses the file record once; used to
+    /// resolve a cacheable range so hot-path lookups can avoid re-parsing it.
+    pub(crate) fn summaries_byte_range(
+        &self,
+        daf_idx: Option<usize>,
+    ) -> Result<(usize, usize), DAFError> {
+        let rcrd_idx = (daf_idx.unwrap_or(self.file_record()?.fwrd_idx()) - 1) * RCRD_LEN;
+        Ok((rcrd_idx + SummaryRecord::SIZE, rcrd_idx + RCRD_LEN))
+    }
+
+    /// Returns the data summaries in the provided byte range, without parsing the
+    /// file record. Any out-of-bounds or misaligned range returns None.
+    pub(crate) fn data_summaries_in_range(&self, range: (usize, usize)) -> Option<&[R]> {
+        let rcrd_bytes = self.bytes.get(range.0..range.1)?;
+        Ref::<_, [R]>::from_bytes(rcrd_bytes)
+            .map(Ref::into_ref)
+            .ok()
+    }
+
+    /// Returns the f64 slice in the provided byte range, without parsing the file
+    /// record. Any out-of-bounds or misaligned range returns None.
+    pub(crate) fn f64_data_in_range(&self, range: (usize, usize)) -> Option<&[f64]> {
+        let data_bytes = self.bytes.get(range.0..range.1)?;
+        Ref::<&[u8], [f64]>::from_bytes(data_bytes)
+            .map(Ref::into_ref)
+            .ok()
+    }
+
     /// Returns the summary given the name of the summary record
     pub fn summary_from_name(&self, name: &str) -> Result<(&R, Option<usize>, usize), DAFError> {
         // Catch the error until we've reached the last summary.
@@ -456,6 +485,15 @@ impl<R: NAIFSummaryRecord> DAF<R> {
                     kind: S::DATASET_NAME,
                 })?;
 
+        let data = self.data_slice(this_summary, idx)?;
+
+        // Convert it
+        S::from_f64_slice(data).context(DecodingDataSnafu { kind: R::NAME, idx })
+    }
+
+    /// Returns the raw f64 data slice covered by the provided summary record.
+    /// `idx` is used solely for error context.
+    pub(crate) fn data_slice(&self, this_summary: &R, idx: usize) -> Result<&[f64], DAFError> {
         // Grab the data in native endianness
         if self.file_record()?.is_empty() || this_summary.is_empty() {
             return Err(DAFError::FileRecord {
@@ -493,8 +531,7 @@ impl<R: NAIFSummaryRecord> DAF<R> {
             })?,
         );
 
-        // Convert it
-        S::from_f64_slice(data).context(DecodingDataSnafu { kind: R::NAME, idx })
+        Ok(data)
     }
 
     pub fn comments(&self) -> Result<Option<String>, DAFError> {

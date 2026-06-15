@@ -100,3 +100,7 @@ harness = false
 [[bench]]
 name = "crit_planetary_data"
 harness = false
+
+[[bench]]
+name = "crit_spk_cache"
+harness = false
